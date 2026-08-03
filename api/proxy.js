@@ -5,16 +5,8 @@ export const config = {
   maxDuration: 60,
 };
 
+// 内存签名存储 (以 tool_call_id 或 index 为 key)
 const signatureCache = new Map();
-
-// 核心：BLOCK_NONE 安全关停配置
-const BLOCK_NONE_SAFETY_SETTINGS = [
-  { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-  { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-  { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-  { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-  { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" }
-];
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -33,8 +25,18 @@ export default async function handler(req, res) {
   }
 
   if (targetPath === '/' || targetPath === '') {
-    return res.status(200).json({ status: "ok", message: "Gemini Full-Feature Proxy Active!" });
+    return res.status(200).json({ status: "ok", message: "Gemini Memory-Bridged Proxy Active!" });
   }
+
+  if (targetPath.startsWith('/v1/chat/') || targetPath.startsWith('/v1/embeddings')) {
+    targetPath = targetPath.replace('/v1/', '/v1beta/openai/');
+  } else if (targetPath === '/v1/models') {
+    targetPath = '/v1beta/openai/models';
+  } else if (!targetPath.startsWith('/v1beta/')) {
+    targetPath = '/v1beta/openai' + targetPath;
+  }
+
+  const targetUrl = `https://generativelanguage.googleapis.com${targetPath}${url.search}`;
 
   try {
     const chunks = [];
@@ -43,105 +45,36 @@ export default async function handler(req, res) {
     }
     let bodyBuffer = Buffer.concat(chunks);
 
-    // 提取 API Key (兼容 Header 和 URL)
-    let apiKey = '';
-    const authHeader = req.headers['authorization'] || req.headers['Authorization'] || '';
-    if (authHeader.startsWith('Bearer ')) {
-      apiKey = authHeader.substring(7).trim();
-    } else if (url.searchParams.has('key')) {
-      apiKey = url.searchParams.get('key');
-    }
+    // 🎯 入站拦截：检测客户端发来的历史记录，自动缝合之前被客户端吞掉的 thought_signature
+    if (req.method === 'POST' && bodyBuffer.length > 0) {
+      try {
+        let bodyJson = JSON.parse(bodyBuffer.toString('utf-8'));
 
-    // 🎯 检测如果是 Kelivo 发来的 OpenAI Chat 请求
-    if ((targetPath.startsWith('/v1/chat/completions') || targetPath.includes('/chat/completions')) && req.method === 'POST') {
-      const openaiJson = JSON.parse(bodyBuffer.toString('utf-8'));
-      const model = openaiJson.model || 'gemini-2.5-flash';
+        if (bodyJson.messages && Array.isArray(bodyJson.messages)) {
+          bodyJson.messages.forEach((msg) => {
+            if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
+              msg.tool_calls.forEach((tc) => {
+                const cachedSig = signatureCache.get(tc.id);
+                if (!tc.extra_content) tc.extra_content = {};
+                if (!tc.extra_content.google) tc.extra_content.google = {};
 
-      // 路由发往 Google 原生 API（原生 API 才合法允许 safetySettings）
-      const targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
-
-      let systemInstruction = undefined;
-      const contents = [];
-
-      // 1. 将 OpenAI messages 转化为 Google Native contents
-      (openaiJson.messages || []).forEach(msg => {
-        if (msg.role === 'system') {
-          systemInstruction = { parts: [{ text: msg.content || '' }] };
-        } else if (msg.role === 'user') {
-          contents.push({
-            role: 'user',
-            parts: [{ text: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) }]
-          });
-        } else if (msg.role === 'assistant') {
-          const parts = [];
-          if (msg.content) parts.push({ text: msg.content });
-          if (msg.tool_calls) {
-            msg.tool_calls.forEach(tc => {
-              const cachedSig = signatureCache.get(tc.id);
-              parts.push({
-                functionCall: {
-                  name: tc.function?.name,
-                  args: typeof tc.function?.arguments === 'string' ? JSON.parse(tc.function?.arguments) : (tc.function?.arguments || {}),
-                  thought_signature: cachedSig || "skip_thought_signature_validator"
+                // 优先填入内存中保存的真实签名；如果内存过期则填入官方允许的跳过标识
+                if (cachedSig) {
+                  tc.extra_content.google.thought_signature = cachedSig;
+                } else if (!tc.extra_content.google.thought_signature) {
+                  tc.extra_content.google.thought_signature = "skip_thought_signature_validator";
                 }
               });
-            });
-          }
-          contents.push({ role: 'model', parts });
-        } else if (msg.role === 'tool') {
-          contents.push({
-            role: 'function',
-            parts: [{
-              functionResponse: {
-                name: msg.name || 'tool',
-                response: { result: msg.content }
-              }
-            }]
+            }
           });
         }
-      });
 
-      // 2. 组装支持 BLOCK_NONE 的原生 Payload
-      const nativePayload = {
-        contents: contents,
-        safetySettings: BLOCK_NONE_SAFETY_SETTINGS,
-      };
-      if (systemInstruction) nativePayload.systemInstruction = systemInstruction;
-      if (openaiJson.temperature !== undefined) {
-        nativePayload.generationConfig = { temperature: openaiJson.temperature };
+        bodyBuffer = Buffer.from(JSON.stringify(bodyJson), 'utf-8');
+      } catch (e) {
+        // 非 JSON 不处理
       }
-
-      bodyBuffer = Buffer.from(JSON.stringify(nativePayload), 'utf-8');
-
-      // 3. 发送给 Google 原生接口（不传递 Bearer，防止 401）
-      const headers = { 'content-type': 'application/json' };
-      if (apiKey) headers['x-goog-api-key'] = apiKey;
-
-      const response = await fetch(targetUrl, { method: 'POST', headers, body: bodyBuffer });
-      res.status(response.status);
-
-      if (response.body) {
-        const reader = response.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(value);
-        }
-        res.end();
-      } else {
-        res.end();
-      }
-      return;
     }
 
-    // 普通非 Chat 请求退回标准透传
-    if (targetPath.startsWith('/v1/')) {
-      targetPath = targetPath.replace('/v1/', '/v1beta/openai/');
-    } else if (!targetPath.startsWith('/v1beta/')) {
-      targetPath = '/v1beta/openai' + targetPath;
-    }
-
-    const targetUrl = `https://generativelanguage.googleapis.com${targetPath}${url.search}`;
     const headers = { ...req.headers };
     delete headers.host;
     delete headers.connection;
@@ -153,20 +86,57 @@ export default async function handler(req, res) {
       body: req.method !== 'GET' && req.method !== 'HEAD' ? bodyBuffer : undefined,
     });
 
+    response.headers.forEach((value, key) => {
+      if (key.toLowerCase() !== 'content-encoding' && key.toLowerCase() !== 'content-length') {
+        res.setHeader(key, value);
+      }
+    });
+
     res.status(response.status);
 
+    // 🎯 出站拦截：如果是流式输出，捕获 Google 返回的 thought_signature 并存入内存 Cache
     if (response.body) {
       const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let bufferStr = '';
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+
         res.write(value);
+
+        // 解析 SSE 字符串并记录签名
+        bufferStr += decoder.decode(value, { stream: true });
+        const lines = bufferStr.split('\n');
+        bufferStr = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+            try {
+              const json = JSON.parse(line.slice(6));
+              const choices = json.choices || [];
+              for (const choice of choices) {
+                const delta = choice.delta || {};
+                if (delta.tool_calls) {
+                  delta.tool_calls.forEach((tc) => {
+                    const sig = tc.extra_content?.google?.thought_signature;
+                    if (tc.id && sig) {
+                      signatureCache.set(tc.id, sig);
+                    }
+                  });
+                }
+              }
+            } catch (e) {
+              // 忽略解析失败的 chunk
+            }
+          }
+        }
       }
       res.end();
     } else {
       res.end();
     }
-
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
