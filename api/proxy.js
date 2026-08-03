@@ -5,8 +5,16 @@ export const config = {
   maxDuration: 60,
 };
 
-// 内存签名存储 (以 tool_call_id 或 index 为 key)
 const signatureCache = new Map();
+
+// 🎯 全量关停安全过滤器 (Block None)
+const BLOCK_NONE_SAFETY_SETTINGS = [
+  { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+  { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+  { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+  { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+  { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" }
+];
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -25,7 +33,7 @@ export default async function handler(req, res) {
   }
 
   if (targetPath === '/' || targetPath === '') {
-    return res.status(200).json({ status: "ok", message: "Gemini Memory-Bridged Proxy Active!" });
+    return res.status(200).json({ status: "ok", message: "Gemini Safety-Disabled Proxy Active!" });
   }
 
   if (targetPath.startsWith('/v1/chat/') || targetPath.startsWith('/v1/embeddings')) {
@@ -45,11 +53,16 @@ export default async function handler(req, res) {
     }
     let bodyBuffer = Buffer.concat(chunks);
 
-    // 🎯 入站拦截：检测客户端发来的历史记录，自动缝合之前被客户端吞掉的 thought_signature
+    // 🎯 核心逻辑：拦截请求体，强行注入 BLOCK_NONE 与 签名缝合
     if (req.method === 'POST' && bodyBuffer.length > 0) {
       try {
         let bodyJson = JSON.parse(bodyBuffer.toString('utf-8'));
 
+        // 1. 强行注入 Safety Settings 为 BLOCK_NONE
+        bodyJson.safetySettings = BLOCK_NONE_SAFETY_SETTINGS;
+        bodyJson.safety_settings = BLOCK_NONE_SAFETY_SETTINGS;
+
+        // 2. 自动缝合 thought_signature (保证 MCP 顺畅)
         if (bodyJson.messages && Array.isArray(bodyJson.messages)) {
           bodyJson.messages.forEach((msg) => {
             if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
@@ -58,7 +71,6 @@ export default async function handler(req, res) {
                 if (!tc.extra_content) tc.extra_content = {};
                 if (!tc.extra_content.google) tc.extra_content.google = {};
 
-                // 优先填入内存中保存的真实签名；如果内存过期则填入官方允许的跳过标识
                 if (cachedSig) {
                   tc.extra_content.google.thought_signature = cachedSig;
                 } else if (!tc.extra_content.google.thought_signature) {
@@ -71,7 +83,7 @@ export default async function handler(req, res) {
 
         bodyBuffer = Buffer.from(JSON.stringify(bodyJson), 'utf-8');
       } catch (e) {
-        // 非 JSON 不处理
+        // 非 JSON 请求跳过
       }
     }
 
@@ -94,7 +106,6 @@ export default async function handler(req, res) {
 
     res.status(response.status);
 
-    // 🎯 出站拦截：如果是流式输出，捕获 Google 返回的 thought_signature 并存入内存 Cache
     if (response.body) {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -106,7 +117,6 @@ export default async function handler(req, res) {
 
         res.write(value);
 
-        // 解析 SSE 字符串并记录签名
         bufferStr += decoder.decode(value, { stream: true });
         const lines = bufferStr.split('\n');
         bufferStr = lines.pop() || '';
@@ -128,7 +138,7 @@ export default async function handler(req, res) {
                 }
               }
             } catch (e) {
-              // 忽略解析失败的 chunk
+              // 忽略
             }
           }
         }
