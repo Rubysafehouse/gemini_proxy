@@ -1,15 +1,5 @@
 {
   "version": 2,
   "regions": ["iad1"],
-  "trailingSlash": false,
-  "rewrites": [
-    {
-      "source": "/v1/(.*)",
-      "destination": "/api/proxy"
-    },
-    {
-      "source": "/v1",
-      "destination": "/api/proxy"
-    }
-  ]
+  "trailingSlash": false
 }
