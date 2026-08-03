@@ -4,7 +4,7 @@
   "rewrites": [
     {
       "source": "/:path*",
-      "destination": "/api/proxy"
+      "destination": "/api/proxy?url=/:path*"
     }
   ]
 }
