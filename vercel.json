@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "regions": ["iad1"],
+  "regions": ["sfo1"],
   "rewrites": [
     {
       "source": "/((?!api/proxy).*)",
