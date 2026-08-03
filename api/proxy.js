@@ -1,10 +1,9 @@
-// 声明使用 Vercel Edge 运行时，保证原生 SSE 流式输出和零拷贝传输
 export const config = {
   runtime: 'edge',
 };
 
 export default async function handler(request) {
-  // 1. 动态处理 CORS 预检（解决 Kelivo 跨域问题）
+  // 1. 动态处理 CORS 预检 (OPTIONS)
   if (request.method === 'OPTIONS') {
     return new Response(null, {
       status: 204,
@@ -20,29 +19,38 @@ export default async function handler(request) {
   const url = new URL(request.url);
   let targetPath = url.pathname;
 
-  // 2. 智能路径映射：兼容 /v1 和 /v1/ 两种情况，防止触发 308 重定向
-  if (targetPath.startsWith('/v1/') || targetPath === '/v1') {
-    targetPath = '/v1beta/openai' + targetPath.substring('/v1'.length);
+  // 2. 根目录保活 (解决 Vercel 根目录 404 报错，让你访问域名时看到成功状态)
+  if (targetPath === '/' || targetPath === '') {
+    return new Response(JSON.stringify({ status: "ok", message: "Gemini Vercel Proxy is active!" }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    });
+  }
+
+  // 3. 智能路径映射：将 /v1/ 自动转为 Google 官方 OpenAI 路径
+  if (targetPath.startsWith('/v1/')) {
+    targetPath = targetPath.replace('/v1/', '/v1beta/openai/');
+  } else if (targetPath === '/v1') {
+    targetPath = '/v1beta/openai/';
   } else if (!targetPath.startsWith('/v1beta/')) {
     targetPath = '/v1beta/openai' + targetPath;
   }
 
   const targetUrl = new URL(`https://generativelanguage.googleapis.com${targetPath}${url.search}`);
 
-  // 3. 构造请求 Header（透传所有请求头，只修改 Host）
+  // 4. 构造请求 Headers
   const reqHeaders = new Headers(request.headers);
   reqHeaders.set('host', 'generativelanguage.googleapis.com');
 
   try {
-    // 4. 纯字节流转发（不破坏 JSON，完美支持 MCP 和流式打字机）
+    // 5. 纯字节流透明转发给 Google
     const response = await fetch(targetUrl.toString(), {
       method: request.method,
       headers: reqHeaders,
-      body: request.body, 
+      body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined,
       redirect: 'follow'
     });
 
-    // 5. 注入 CORS 跨域响应头后返回给 Kelivo
     const resHeaders = new Headers(response.headers);
     resHeaders.set('Access-Control-Allow-Origin', '*');
 
