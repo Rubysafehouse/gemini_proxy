@@ -3,7 +3,7 @@
   "regions": ["iad1"],
   "rewrites": [
     {
-      "source": "/(.*)",
+      "source": "/((?!api/proxy).*)",
       "destination": "/api/proxy"
     }
   ]
