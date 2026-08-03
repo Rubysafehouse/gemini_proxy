@@ -1,28 +1,34 @@
 export const config = {
   api: {
-    bodyParser: false, // 禁用默认解析，保证 100% 原始字节流，绝对不损坏数据
+    bodyParser: false, // 禁用默认解析，保证 100% 原始字节流，绝不损坏 MCP 参数
   },
-  maxDuration: 60, // 强制将超时时间提升至免费版最高上限 60 秒，杜绝 504
+  maxDuration: 60, // 强制将超时提升至最高 60 秒，彻底解决 504 TIMEOUT
 };
 
 export default async function handler(req, res) {
-  // 1. 处理 CORS 预检跨域
+  // 1. 设置跨域 Header
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+
   if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || '*');
     return res.status(204).end();
   }
 
-  const url = new URL(req.url, `https://${req.headers.host}`);
-  let targetPath = url.pathname;
+  // 2. 提取原始请求路径
+  let targetPath = req.url || '/';
+
+  // 防止内部路径冲突
+  if (targetPath.startsWith('/api/proxy')) {
+    targetPath = targetPath.replace('/api/proxy', '');
+  }
 
   // 根目录探针
   if (targetPath === '/' || targetPath === '') {
-    return res.status(200).json({ status: "ok", message: "Gemini Node Proxy is running with 60s timeout!" });
+    return res.status(200).json({ status: "ok", message: "Gemini 60s Proxy is active!" });
   }
 
-  // 智能路径映射 (同时兼容 Native 和 OpenAI)
+  // 3. 智能路径兼容 (支持 OpenAI 模式 与 Gemini 原生模式)
   if (targetPath.startsWith('/v1/')) {
     targetPath = targetPath.replace('/v1/', '/v1beta/openai/');
   } else if (targetPath === '/v1') {
@@ -31,39 +37,39 @@ export default async function handler(req, res) {
     targetPath = '/v1beta/openai' + targetPath;
   }
 
-  const targetUrl = `https://generativelanguage.googleapis.com${targetPath}${url.search}`;
+  const targetUrl = `https://generativelanguage.googleapis.com${targetPath}`;
 
   try {
-    // 2. 提取最原始的二进制请求体
-    let bodyBuffer = [];
+    // 4. 读取原始二进制 Request Body
+    const chunks = [];
     for await (const chunk of req) {
-      bodyBuffer.push(chunk);
+      chunks.push(chunk);
     }
-    const rawBody = Buffer.concat(bodyBuffer);
+    const body = Buffer.concat(chunks);
 
-    // 3. 发送请求至 Google (携带原生鉴权 Header)
+    // 5. 转发 Header 清理
+    const headers = { ...req.headers };
+    delete headers.host;
+    delete headers.connection;
+    delete headers['content-length'];
+
+    // 6. 发送至 Google 官方 API
     const response = await fetch(targetUrl, {
       method: req.method,
-      headers: {
-        'Content-Type': req.headers['content-type'] || 'application/json',
-        'Authorization': req.headers['authorization'] || '',
-        'x-goog-api-key': req.headers['x-goog-api-key'] || '',
-      },
-      body: req.method !== 'GET' && req.method !== 'HEAD' ? rawBody : undefined,
+      headers: headers,
+      body: req.method !== 'GET' && req.method !== 'HEAD' ? body : undefined,
     });
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    
-    // 过滤掉可能引起冲突的 Node.js 内部 Header
+    // 7. 透传 Response Headers
     response.headers.forEach((value, key) => {
-      if (key.toLowerCase() !== 'content-encoding' && key.toLowerCase() !== 'transfer-encoding') {
+      if (key.toLowerCase() !== 'content-encoding' && key.toLowerCase() !== 'content-length') {
         res.setHeader(key, value);
       }
     });
 
     res.status(response.status);
 
-    // 4. 完美兼容 SSE 打字机流式输出
+    // 8. 原生 SSE 流式打字机响应输出
     if (response.body) {
       const reader = response.body.getReader();
       while (true) {
@@ -73,9 +79,8 @@ export default async function handler(req, res) {
       }
       res.end();
     } else {
-      res.send(await response.text());
+      res.end();
     }
-
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
