@@ -5,10 +5,10 @@ export const config = {
   maxDuration: 60,
 };
 
-// 内存签名存储 (以 tool_call_id 或 index 为 key)
+// 内存签名存储 (解决 OpenAI 格式丢失 thought_signature 的问题)
 const signatureCache = new Map();
 
-// 全局指针（在 Vercel 函数实例存活期间持续轮转）
+// 全局轮转指针
 let currentKeyIndex = 0;
 
 // 从环境变量读取 API Key 列表 (支持逗号分隔多个 Key)
@@ -105,6 +105,27 @@ export default async function handler(req, res) {
       return res.status(401).json({ error: "No Gemini API Key found in env or request." });
     }
 
+    // 🎯 清理基础 Headers，防止大小写重复及非法 Headers
+    const baseHeaders = { ...req.headers };
+    Object.keys(baseHeaders).forEach((key) => {
+      const lowerKey = key.toLowerCase();
+      if (
+        lowerKey === 'host' ||
+        lowerKey === 'connection' ||
+        lowerKey === 'content-length' ||
+        lowerKey === 'authorization' ||
+        lowerKey === 'x-goog-api-key'
+      ) {
+        delete baseHeaders[key];
+      }
+    });
+
+    // 🎯 规范 URL，删除可能存在的 ?key= 参数
+    const targetUrlObj = new URL(`https://generativelanguage.googleapis.com${targetPath}`);
+    url.searchParams.forEach((val, key) => {
+      if (key !== 'key') targetUrlObj.searchParams.append(key, val);
+    });
+
     let response = null;
     let attempts = 0;
     const maxAttempts = keysToTry.length;
@@ -114,20 +135,9 @@ export default async function handler(req, res) {
       attempts++;
       const activeKey = getNextApiKey(keysToTry);
 
-      const targetUrlObj = new URL(`https://generativelanguage.googleapis.com${targetPath}`);
-      url.searchParams.forEach((val, key) => {
-        if (key !== 'key') targetUrlObj.searchParams.append(key, val);
-      });
-
-      const headers = { ...req.headers };
-      delete headers.host;
-      delete headers.connection;
-      delete headers['content-length'];
-
-      // 🎯 核心修复：强制注入当前轮转 Key 到 Authorization Bearer，适配 Google OpenAI 兼容层
-      headers['authorization'] = `Bearer ${activeKey}`;
+      const headers = { ...baseHeaders };
+      // 保证有且仅有一个干净的 Authorization Header
       headers['Authorization'] = `Bearer ${activeKey}`;
-      headers['x-goog-api-key'] = activeKey;
 
       response = await fetch(targetUrlObj.toString(), {
         method: req.method,
@@ -135,7 +145,7 @@ export default async function handler(req, res) {
         body: req.method !== 'GET' && req.method !== 'HEAD' ? bodyBuffer : undefined,
       });
 
-      // 若遇到 429 (频率受限) 或 403 (配额耗尽)，且还有备用 Key，则自动换下一个 Key 重试
+      // 若遇到 429 (频率受限) 或 403 (配额耗尽)，且还有备用 Key，自动换下一个 Key 重试
       if ((response.status === 429 || response.status === 403) && attempts < maxAttempts) {
         continue;
       }
@@ -151,7 +161,7 @@ export default async function handler(req, res) {
 
     res.status(response.status);
 
-    // 🎯 出站拦截：如果是流式输出，捕获 Google 返回的 thought_signature 并存入内存 Cache
+    // 🎯 出站拦截：流式捕获 thought_signature 存入内存
     if (response.body) {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
