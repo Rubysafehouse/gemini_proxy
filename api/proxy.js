@@ -8,6 +8,23 @@ export const config = {
 // 内存签名存储 (以 tool_call_id 或 index 为 key)
 const signatureCache = new Map();
 
+// 🎯 1. 全局指针（在 Vercel 函数实例存活期间持续轮转）
+let currentKeyIndex = 0;
+
+// 从环境变量读取 API Key 列表 (支持逗号分隔多个 Key)
+function getApiKeys() {
+  const keysStr = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '';
+  return keysStr.split(',').map(k => k.trim()).filter(Boolean);
+}
+
+// 获取下一个 Key
+function getNextApiKey(keys) {
+  if (!keys || keys.length === 0) return null;
+  const key = keys[currentKeyIndex % keys.length];
+  currentKeyIndex = (currentKeyIndex + 1) % keys.length;
+  return key;
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -25,7 +42,7 @@ export default async function handler(req, res) {
   }
 
   if (targetPath === '/' || targetPath === '') {
-    return res.status(200).json({ status: "ok", message: "Gemini Memory-Bridged Proxy Active!" });
+    return res.status(200).json({ status: "ok", message: "Gemini Key-Rotating Proxy Active!" });
   }
 
   if (targetPath.startsWith('/v1/chat/') || targetPath.startsWith('/v1/embeddings')) {
@@ -35,8 +52,6 @@ export default async function handler(req, res) {
   } else if (!targetPath.startsWith('/v1beta/')) {
     targetPath = '/v1beta/openai' + targetPath;
   }
-
-  const targetUrl = `https://generativelanguage.googleapis.com${targetPath}${url.search}`;
 
   try {
     const chunks = [];
@@ -75,16 +90,61 @@ export default async function handler(req, res) {
       }
     }
 
-    const headers = { ...req.headers };
-    delete headers.host;
-    delete headers.connection;
-    delete headers['content-length'];
+    // 🎯 2. 解析可用的 API Key 列表
+    const envKeys = getApiKeys();
+    let clientKey = '';
+    const authHeader = req.headers['authorization'] || req.headers['Authorization'] || '';
+    if (authHeader.startsWith('Bearer ')) {
+      clientKey = authHeader.substring(7).trim();
+    } else if (url.searchParams.has('key')) {
+      clientKey = url.searchParams.get('key');
+    }
 
-    const response = await fetch(targetUrl, {
-      method: req.method,
-      headers: headers,
-      body: req.method !== 'GET' && req.method !== 'HEAD' ? bodyBuffer : undefined,
-    });
+    // 优先使用环境变量中的多 Key 轮转；若没配环境变量，则降级使用客户端传入的单 Key
+    const keysToTry = envKeys.length > 0 ? envKeys : (clientKey ? [clientKey] : []);
+
+    if (keysToTry.length === 0) {
+      return res.status(401).json({ error: "No Gemini API Key found in env or request." });
+    }
+
+    let response = null;
+    let attempts = 0;
+    const maxAttempts = keysToTry.length;
+
+    // 🎯 3. 轮转与限额重试循环 (Failover)
+    while (attempts < maxAttempts) {
+      attempts++;
+      const activeKey = getNextApiKey(keysToTry);
+
+      // 构建目标请求 URL，注入当前轮转到的 Key
+      const targetUrlObj = new URL(`https://generativelanguage.googleapis.com${targetPath}`);
+      url.searchParams.forEach((val, key) => {
+        if (key !== 'key') targetUrlObj.searchParams.append(key, val);
+      });
+      targetUrlObj.searchParams.set('key', activeKey);
+
+      const headers = { ...req.headers };
+      delete headers.host;
+      delete headers.connection;
+      delete headers['content-length'];
+      // 抹除原本的 Authorization 避免与当前的 activeKey 冲突
+      delete headers['authorization'];
+      delete headers['Authorization'];
+      headers['x-goog-api-key'] = activeKey;
+
+      response = await fetch(targetUrlObj.toString(), {
+        method: req.method,
+        headers: headers,
+        body: req.method !== 'GET' && req.method !== 'HEAD' ? bodyBuffer : undefined,
+      });
+
+      // 若遇到 429 (频率受限) 或 403 (配额耗尽)，且还有备用 Key，则自动换下一个 Key 重试
+      if ((response.status === 429 || response.status === 403) && attempts < maxAttempts) {
+        continue;
+      }
+
+      break;
+    }
 
     response.headers.forEach((value, key) => {
       if (key.toLowerCase() !== 'content-encoding' && key.toLowerCase() !== 'content-length') {
