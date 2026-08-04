@@ -8,7 +8,7 @@ export const config = {
 // 内存签名存储 (以 tool_call_id 或 index 为 key)
 const signatureCache = new Map();
 
-// 🎯 1. 全局指针（在 Vercel 函数实例存活期间持续轮转）
+// 全局指针（在 Vercel 函数实例存活期间持续轮转）
 let currentKeyIndex = 0;
 
 // 从环境变量读取 API Key 列表 (支持逗号分隔多个 Key)
@@ -60,7 +60,7 @@ export default async function handler(req, res) {
     }
     let bodyBuffer = Buffer.concat(chunks);
 
-    // 🎯 入站拦截：检测客户端发来的历史记录，自动缝合之前被客户端吞掉的 thought_signature
+    // 🎯 入站拦截：检测历史记录，自动缝合 thought_signature
     if (req.method === 'POST' && bodyBuffer.length > 0) {
       try {
         let bodyJson = JSON.parse(bodyBuffer.toString('utf-8'));
@@ -73,7 +73,6 @@ export default async function handler(req, res) {
                 if (!tc.extra_content) tc.extra_content = {};
                 if (!tc.extra_content.google) tc.extra_content.google = {};
 
-                // 优先填入内存中保存的真实签名；如果内存过期则填入官方允许的跳过标识
                 if (cachedSig) {
                   tc.extra_content.google.thought_signature = cachedSig;
                 } else if (!tc.extra_content.google.thought_signature) {
@@ -90,7 +89,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 🎯 2. 解析可用的 API Key 列表
+    // 🎯 解析可用的 API Key 列表
     const envKeys = getApiKeys();
     let clientKey = '';
     const authHeader = req.headers['authorization'] || req.headers['Authorization'] || '';
@@ -100,7 +99,6 @@ export default async function handler(req, res) {
       clientKey = url.searchParams.get('key');
     }
 
-    // 优先使用环境变量中的多 Key 轮转；若没配环境变量，则降级使用客户端传入的单 Key
     const keysToTry = envKeys.length > 0 ? envKeys : (clientKey ? [clientKey] : []);
 
     if (keysToTry.length === 0) {
@@ -111,25 +109,24 @@ export default async function handler(req, res) {
     let attempts = 0;
     const maxAttempts = keysToTry.length;
 
-    // 🎯 3. 轮转与限额重试循环 (Failover)
+    // 🎯 轮转与限额重试循环 (Failover)
     while (attempts < maxAttempts) {
       attempts++;
       const activeKey = getNextApiKey(keysToTry);
 
-      // 构建目标请求 URL，注入当前轮转到的 Key
       const targetUrlObj = new URL(`https://generativelanguage.googleapis.com${targetPath}`);
       url.searchParams.forEach((val, key) => {
         if (key !== 'key') targetUrlObj.searchParams.append(key, val);
       });
-      targetUrlObj.searchParams.set('key', activeKey);
 
       const headers = { ...req.headers };
       delete headers.host;
       delete headers.connection;
       delete headers['content-length'];
-      // 抹除原本的 Authorization 避免与当前的 activeKey 冲突
-      delete headers['authorization'];
-      delete headers['Authorization'];
+
+      // 🎯 核心修复：强制注入当前轮转 Key 到 Authorization Bearer，适配 Google OpenAI 兼容层
+      headers['authorization'] = `Bearer ${activeKey}`;
+      headers['Authorization'] = `Bearer ${activeKey}`;
       headers['x-goog-api-key'] = activeKey;
 
       response = await fetch(targetUrlObj.toString(), {
@@ -166,7 +163,6 @@ export default async function handler(req, res) {
 
         res.write(value);
 
-        // 解析 SSE 字符串并记录签名
         bufferStr += decoder.decode(value, { stream: true });
         const lines = bufferStr.split('\n');
         bufferStr = lines.pop() || '';
